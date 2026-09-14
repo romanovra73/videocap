@@ -1,0 +1,141 @@
+#include "dvr.h"
+
+    void DVR_channel::connect_DVR() {
+	auto start = chrono::system_clock::now();
+	this->capture = VideoCapture(this->connection_string);
+	while (!this->capture.isOpened()) {
+    	    cout << "Unable to get stream. Wait..." << endl;
+	    usleep(2000000);
+	    this->capture = VideoCapture(this->connection_string);
+	}
+	auto end = chrono::system_clock::now();
+	auto mss = chrono::duration_cast<chrono::milliseconds>(end-start);
+	long long ms = mss.count();
+	cout << "Channel connected in " << ms << "ms" << endl;
+	this->capture.set(CAP_PROP_BUFFERSIZE, 1);
+    }
+    
+    void DVR_channel::grab_frame() {
+	int grab_fails = 0;
+	const int max_grab_fails = 5;
+	for (int i=0; i<100; i++) {
+	    auto start = chrono::system_clock::now();
+	    bool isGrabbed = this->capture.grab();
+	    auto end = chrono::system_clock::now();
+	    auto mss = chrono::duration_cast<chrono::milliseconds>(end-start);
+	    long long ms = mss.count();
+	    if (isGrabbed) {
+		if (ms>50)
+		    break;
+	    } else {
+		grab_fails++;
+		if (grab_fails>=max_grab_fails) {
+		    cout << "Try to reconnect DVR..." << endl;
+		    this->connect_DVR();
+		    grab_fails = 0;
+		    i = 0;
+		}
+	    }
+	}
+    }
+    
+    double DVR_channel::get_buffer_size() {
+	return this->capture.get(CAP_PROP_BUFFERSIZE);
+    }
+    
+    bool DVR_channel::check_frame(Mat frame, int blur_filter, bool ignore_size, int &empty_frames) {
+	if (frame.empty()) {
+	    empty_frames++;
+	    return false;
+	}
+	if (!ignore_size) {
+	    if (frame.rows!=this->frame_height || frame.cols!=this->frame_width) {
+		empty_frames++;
+		return false;
+	    }
+	}
+	if (blur_filter>0 && get_blur_varience(frame)<blur_filter)
+	    return false;
+	return true;
+    }
+    
+    double DVR_channel::get_blur_varience(Mat frame) {
+	return 600;
+    }
+	
+    DVR_channel::DVR_channel(pqxx::work &db_work, string id, unsigned chan, bool main) {
+	error = "";
+	string query = "";
+	if (main) 
+	    query = "SELECT address, port, dvr_user, password, suffix, main_stream AS stream, main_stream_width AS width, main_stream_height AS height FROM cv.recorders WHERE id=$1";
+	else
+	    query = "SELECT address, port, dvr_user, password, suffix, sub_stream AS stream, sub_stream_width AS width, sub_stream_height AS height FROM cv.recorders WHERE id=$1";
+	pqxx::result res = db_work.exec_params(query, pqxx::params{id});
+	db_work.commit();
+	if (size(res)==0) {
+	    error = "No data for DVR "+id;
+	    return;
+	}
+	
+	pqxx::row const row = res[0];
+	string address = row[0].c_str();
+	string port = row[1].c_str();
+	string user = row[2].c_str();
+	string passwd = row[3].c_str();
+	string suff = row[4].c_str();
+	string stream = row[5].c_str();
+	this->connection_string = "rtsp://"+address+":"+port+"/user="+user+"&password="+passwd+"&channel="+to_string(chan)+"&stream="+stream+suff;
+	cout << "Try to connect DVR " << id << " channel " << chan << endl;
+	this->connect_DVR();
+	this->channel = chan;
+	this->main_stream = main;
+	this->frame_width = this->capture.get(CAP_PROP_FRAME_WIDTH);
+	this->frame_height = this->capture.get(CAP_PROP_FRAME_HEIGHT);
+	this->ID = id;
+    }
+    
+    DVR_channel::~DVR_channel() {
+	this->capture.release();
+	this->ID = "";
+	this->channel = 0;
+	this->connection_string = "";
+    }
+    
+    string DVR_channel::get_last_error() {
+	return this->error;
+    }
+    
+    bool DVR_channel::is_connected() {
+	return this->capture.isOpened();
+    }
+
+    bool DVR_channel::is_main_stream() {
+	return this->main_stream;
+    }
+    
+    void DVR_channel::connect() {
+	this->connect_DVR();
+    }
+    
+    void DVR_channel::release() {
+	this->capture.release();
+    }
+    
+    Mat DVR_channel::get_frame(double blur_filter, bool ignore_size) {
+	Mat frame;
+	const int max_empty_frames = 5;
+	int empty_frames = 0;
+	this->grab_frame();
+	this->capture.retrieve(frame);
+	while(!this->check_frame(frame, blur_filter, ignore_size, empty_frames)) {
+	    usleep(100000);
+	    if (empty_frames>=max_empty_frames) {
+		cout << "Try to reconnect DVR..." << endl;
+		this->connect_DVR();
+		empty_frames = 0;
+	    }
+	    this->grab_frame();
+	    this->capture.retrieve(frame);
+	}
+	return frame;
+    }
